@@ -542,6 +542,8 @@ function newEpisodeRecord(episode, videoId, scheme) {
     cencKey: "",
     decrypted: false,
     decryptError: "",
+    stopQueue: false,
+    downgraded: "",
     file: "",
     bytes: 0,
     totalBytes: 0,
@@ -736,6 +738,32 @@ async function curlParallel(url, dest, referer, maxSec, threads) {
   }
 }
 
+// 解析度策略：優先 target → 1080 → 720；都沒有但最高仍 ≥720 就用最高；
+// 最高低於 720p 回傳 variant=null（呼叫端應停止整條佇列）。
+// 同一部劇以第一集實際選到的解析度為 target，之後各集对齐，缺檔才降級並提示。
+function selectQuality(media, target) {
+  const all = (Array.isArray(media.variants) ? media.variants : [])
+    .filter((variant) => variant && variant.url);
+  if (all.length === 0 && media.url) {
+    all.push({ url: media.url, quality: media.quality || 0 });
+  }
+  const usable = all.filter((variant) => variant.quality >= 720).sort((a, b) => b.quality - a.quality);
+  const best = all.reduce((maximum, variant) => Math.max(maximum, variant.quality || 0), 0);
+  if (usable.length === 0) {
+    return { variant: null, best, downgraded: false };
+  }
+  const order = [target, 1080, 720].filter((height, index, array) =>
+    array.indexOf(height) === index && height >= 720);
+  for (const height of order) {
+    const found = usable.find((variant) => variant.quality === height);
+    if (found) {
+      return { variant: found, best, downgraded: found.quality !== target };
+    }
+  }
+  // 沒有 target/1080/720，但有其他 ≥720 的解析度 → 用最高的
+  return { variant: usable[0], best, downgraded: usable[0].quality !== target };
+}
+
 // 寫入狀態檔前先讀回磁碟上的 paused，
 // 避免下載流程用自己的記憶體狀態把外部的 --pause 覆寫掉（lost update）。
 function saveCtx(ctx) {
@@ -776,6 +804,29 @@ async function downloadEpisode(ctx, record) {
   record.cencKey = media.cencKey || "";
   record.resolvedAt = Date.now();
   record.file = record.file || episodeFilePath(record, ctx.state);
+
+  // 解析度策略（僅 App 線路；--web-360p 是明示要 360p，聽書也不適用）
+  if (!ctx.options.web360 && !record.scheme.startsWith(AUDIO_SCHEME)) {
+    const target = ctx.state.qualityTarget || 1080;
+    const picked = selectQuality(media, target);
+    if (!picked.variant) {
+      record.status = "failed";
+      record.error = `最高僅 ${picked.best}p，低於 720p，停止下載`;
+      record.stopQueue = true;
+      saveCtx(ctx);
+      ctx.onProgress(record, "解析度過低");
+      return "failed";
+    }
+    record.url = picked.variant.url;
+    record.quality = picked.variant.quality;
+    if (!ctx.state.qualityTarget) ctx.state.qualityTarget = picked.variant.quality;
+    if (picked.downgraded) {
+      const message = `第 ${record.episode} 集沒有 ${target}p，改用 ${picked.variant.quality}p`;
+      record.downgraded = message;
+      if (!ctx.options.json) console.log(`\r⚠️  ${message}`);
+    }
+  }
+
   // --web-360p：改用網站自架的 360p 明文（免解密、網站 CDN 速度快），取不到再退回 App 線路
   if (ctx.options.web360 && !record.scheme.startsWith(AUDIO_SCHEME)) {
     const webUrl = `${SITE_BASE}/video/public/${record.videoId}/360p.mp4`;
@@ -964,6 +1015,7 @@ async function runDownloader(ctx) {
   if (!ctx.options.json) {
     console.log(`\n開始下載：${pending.length} 集待處理（共 ${records.length} 集）`);
     console.log(`狀態檔：${ctx.indexFile}`);
+    console.log(`目標解析度：${ctx.state.qualityTarget || 1080}p（沒有才 720p；低於 720p 停止）`);
     console.log("（下載途中可用 --status 看進度、--pause 暫停、Ctrl-C 中斷於分段處）\n");
   }
   for (const [index, record] of pending.entries()) {
@@ -983,6 +1035,13 @@ async function runDownloader(ctx) {
     else if (result === "failed") failed += 1;
     else if (result === "paused") { stopped.reason = "paused"; break; }
     // "removed" — 已被另一個行程移除，直接跳過
+    if (ctx.state.episodes[String(record.episode)]?.stopQueue === true) {
+      stopped.reason = "quality";
+      if (!ctx.options.json) {
+        console.log(`\n⛔ 第 ${record.episode} 集解析度低於 720p，已停止後續下載。`);
+      }
+      break;
+    }
   }
   const summary = { done, failed, stopped: stopped.reason };
   if (!ctx.options.json) {
@@ -993,7 +1052,8 @@ async function runDownloader(ctx) {
     }, {});
     console.log("-".repeat(100));
     console.log(`本輪完成 ${done} 集${failed > 0 ? `，失敗 ${failed} 集` : ""}` +
-      `${stopped.reason === "paused" ? "，已暫停" : ""}`);
+      `${stopped.reason === "paused" ? "，已暫停" : ""}` +
+      `${stopped.reason === "quality" ? "，因解析度低於 720p 停止" : ""}`);
     console.log(`目前狀態：完成 ${counts.done || 0}｜佇列 ${counts.queued || 0}｜暫停 ${counts.paused || 0}｜失敗 ${counts.failed || 0}`);
   }
   return summary;
@@ -1239,7 +1299,8 @@ async function main() {
   }
   if (!options.json) console.log(`\n共 ${chapters.length} 集數`);
 
-  const picked = parseRange(options.range, chapters.length);
+  // 沒給 --range 就是全部集數（下載路徑曾漏掉這個預設，picked 為 null 會擲 "picked is not iterable"）
+  const picked = parseRange(options.range, chapters.length) || chapters.map((_, index) => index + 1);
 
   // -d：建立/更新下載狀態檔並逐集下載（取一流→馬上下載→下一集，避開網址時效）
   if (options.download) {
@@ -1259,6 +1320,7 @@ async function main() {
         createdAt: new Date().toISOString(),
         updatedAt: new Date().toISOString(),
         paused: false,
+        qualityTarget: 1080, // 目標解析度：優先 1080p，沒有才 720p，低於 720p 停止
         episodes: {},
       };
     } else {
