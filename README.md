@@ -6,11 +6,17 @@
 
 | 檔案 | 說明 |
 |------|------|
-| `hongguo_list.mjs` | **主程式**：完整的搜尋 → 選劇 → 分集 → 逐集取流清單工具（Node.js，無外部依賴） |
-| `test/hongguo_list_py.sh` | 舊版純 Python 腳本（只從網頁播放頁正則抓明文 MP4，第 2 集起就會失敗） |
-| `test/hongguo_list.sh` | 舊版 Python 腳本的另一個變體 |
-| `test/run_main.js` | 早期驗證用腳本（已於 2026-11-21 同步修正三個 host bug） |
-| `test/hongguo_probe*.py` | 探索網站介面的過程記錄 |
+| `hongguo_list.mjs` | **主程式**：搜尋 → 選劇 → 分集 → 逐集取流／下載管理（Node.js，無 npm 依賴） |
+| `hongguo/main.js` | 內嵌的紅果站源模組（快照自 [video-src/hongguo](https://github.com/gentoobreaking/video-src)，`--module` 可指向其他位置） |
+| `.gitignore` | 排除執行期產物（見下） |
+| `downloads/`、`index*.json`、`*_urls.txt` | 執行期產生，**不入版控** |
+| `test/` | 舊版探索腳本（留本機，不入版控） |
+
+### 相依
+
+- Node.js ≥ 18（僅用內建模組：`node:child_process` / `node:fs` / `node:crypto` …）
+- `curl`（分段下載與全部 HTTP 請求）
+- `ffmpeg`（CENC 解密；只在 `-d` 下載到加密影片時用到）
 
 ## 用法
 
@@ -45,6 +51,7 @@
 ./hongguo_list.mjs "成家徒四壁" 2 -d                # 逐集下載全部
 ./hongguo_list.mjs "成家徒四壁" 2 -d --range 1-20   # 只下載 1-20 集
 ./hongguo_list.mjs "成家徒四壁" 2 -d --web-360p     # 下載網站自架 360p 明文（快、免解密）
+./hongguo_list.mjs "成家徒四壁" 2 -d --threads 4    # 4 執行緒並行分段下載
 ./hongguo_list.mjs -d                              # 沿用既有 index.json 續下
 ./hongguo_list.mjs --resume                        # 恢復暫停的下載並繼續
 
@@ -57,10 +64,14 @@
 ./hongguo_list.mjs --index index.<sid>.json --status  # 檢視舊劇的狀態
 ```
 
-- 檔案落在 `downloads/hongguo_<劇ID>/<集數>-<標題>.mp4`。
-- CENC 加密的劇集會在同名目錄留下 `<檔案>.cenc.key`（解密用）。
+- 檔案落在 `downloads/hongguo_<劇ID>/ep-<集數>.mp4`（檔名只用集數，避免與「第N集」標題重複）。
+- **CENC 解密**：下載完成後自動用 ffmpeg（`-decryption_key`）把加密 MP4 轉成明文，
+  成功即取代原檔（`--status` 會標記「已解密」）並移除 `.cenc.key`；解密失敗會保留
+  加密原檔與金鑰、在 `--status` 顯示「解密失敗」，不中斷整個佇列。
 - 換一部劇下載時，舊的 `index.json` 會自動輪轉為 `index.<舊劇ID>.json`。
 - `--remove`／`--clear-*` 預設只刪狀態、保留檔案；加 `--with-files` 才刪檔案。
+- `--threads > 1` 先用 HEAD 取得總長度，再用 `curl --parallel` 分段併行下載；
+  取不到長度（CDN 不支援 HEAD）自動退回單執行緒續傳。
 
 ### 狀態（status）
 
@@ -94,11 +105,15 @@
 
 ### 注意事項
 
-- App 線路的 CDN 網址**帶時效簽名**，重新整理請重跑程式。
-- App 線路多為 **CENC 加密**影片，需搭配 `--json` 輸出的 `cencKey` 解密；
-  若要可直接播放的明文檔，用 `--web-360p`（網站自架 360p 預覽，唯部分集數沒有）。
+- App 線路的 CDN 網址**帶時效簽名**，重新整理請重跑程式（`-d` 每集重取就是為此）。
+- App 線路多為 **CENC 加密**影片：`-d` 會在下載完成後自動用 ffmpeg 解密；
+  要完全免加密就用 `-d --web-360p`（網站自架 360p 預覽，唯部分集數沒有）。
 - 本機實測 CDN（qznovelvod.com）連線極慢（~1KB/s），網站自架 360p 則正常；
-  大批下載建議先確認網路到 CDN 的速度。
+  大批下載建議先確認網路到 CDN 的速度，或使用 `--threads`。
+- 換站源模組版本：把新的 `main.js` 放進 `./hongguo/main.js` 即可（或用 `--module` 指向它）。
 - `preserveIntegers`、嚴格 base64、同 realm 載入三個 host 細節都與
   `videoapp/native/core/module_host.go` 對齊，缺一個就會讓 19 位劇集 ID 或
   播放資訊解析失敗。
+
+### 補充
+- 安卓電視（Android TV / Google TV）可以直接使用 VLC、NOVA Video Player 或 Kodi 等播放器來播放 MP4 影片。

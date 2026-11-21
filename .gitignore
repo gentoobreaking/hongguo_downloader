@@ -1,0 +1,20 @@
+# 執行期產物（不進版控）
+index.json
+index.*.json
+downloads/
+
+# 清單工具產生的網址檔
+hongguo_*_urls.txt
+*_urls.txt
+*_variants.txt
+
+# 舊版探索用腳本與採樣檔（留本機；只排除根目錄的 test/，不影響內嵌模組的 hongguo/test/）
+/test/
+
+# 通用
+.DS_Store
+__pycache__/
+*.pyc
+*.log
+.cache/
+node_modules/
